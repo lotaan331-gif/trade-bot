@@ -1,0 +1,152 @@
+import json
+import logging
+import os
+import requests
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import Application, CommandHandler, MessageHandler, filters, CallbackQueryHandler, ContextTypes
+
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO
+)
+logger = logging.getLogger(__name__)
+
+TELEGRAM_BOT_TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN')
+if not TELEGRAM_BOT_TOKEN:
+    raise ValueError("No TELEGRAM_BOT_TOKEN set. Please set it as an environment variable.")
+
+user_data_store = {}
+
+def get_role_label(role_key):
+    roles = {
+        'supplier': 'تامین کننده',
+        'exporter': 'صادر کننده / تاجر',
+        'seller': 'فروشنده',
+        'buyer': 'خریدار',
+        'customs': 'خدمات گمرکی',
+        'logistics': 'حمل و نقل',
+    }
+    return roles.get(role_key, role_key)
+
+def format_contact(contact):
+    lines = [
+        f"👤 *نام:* {contact.get('companyName', 'نامشخص')}",
+        f"📞 *تلفن:* `{contact.get('phone', 'نامشخص')}`",
+        f" भूमिका *نقش:* {get_role_label(contact.get('role'))}",
+        f"📝 *تخصص:* {contact.get('description', 'نامشخص')}",
+        f"🔑 *کلمات کلیدی:* {contact.get('keywords', 'نامشخص')}",
+    ]
+    if contact.get('website'):
+        lines.append(f"🌐 *وب‌سایت:* {contact['website']}")
+    if contact.get('address'):
+        lines.append(f"📍 *آدرس:* {contact['address']}")
+    return "\n".join(lines) + "\n--------------------"
+
+async def show_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE, message_text: str):
+    keyboard = [
+        [InlineKeyboardButton("همه", callback_data='cat_all'), InlineKeyboardButton("تامین کنندگان", callback_data='cat_supplier')],
+        [InlineKeyboardButton("صادر کنندگان", callback_data='cat_exporter'), InlineKeyboardButton("خریداران", callback_data='cat_buyer')],
+        [InlineKeyboardButton("خدمات گمرکی", callback_data='cat_customs'), InlineKeyboardButton("حمل و نقل", callback_data='cat_logistics')]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    if update.callback_query:
+        await update.callback_query.edit_message_text(text=message_text, reply_markup=reply_markup)
+    else:
+        await update.message.reply_text(message_text, reply_markup=reply_markup)
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user_name = update.effective_user.first_name
+    welcome_text = (f"سلام {user_name}!\n\nبه ربات مدیریت شبکه تجاری خوش آمدید.\n\nلطفاً فایل JSON مخاطبین خود یا لینک مستقیم Gist آن را برای من ارسال کنید.")
+    await update.message.reply_text(welcome_text)
+
+async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user_id = update.effective_user.id
+    file = await update.message.document.get_file()
+    file_content = await file.download_as_bytearray()
+    try:
+        contacts = json.loads(file_content.decode('utf-8'))
+        user_data_store[user_id] = contacts
+        logger.info(f"Successfully loaded {len(contacts)} contacts for user {user_id} from file.")
+        await show_main_menu(update, context, f"✅ فایل با موفقیت پردازش شد. {len(contacts)} مخاطب بارگذاری شد.\n\nلطفاً دسته‌بندی مورد نظر را انتخاب کنید:")
+    except Exception as e:
+        logger.error(f"Error processing file for user {user_id}: {e}")
+        await update.message.reply_text(f"❌ خطای غیرمنتظره‌ای رخ داد: {e}")
+
+async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user_id = update.effective_user.id
+    text = update.message.text
+    if "gist.github.com" in text:
+        await update.message.reply_text("⏳ در حال دریافت اطلاعات از لینک...")
+        try:
+            if "/raw/" not in text:
+                if '#' in text:
+                    text = text.split('#')[0]
+                text = text + '/raw'
+            response = requests.get(text)
+            response.raise_for_status()
+            contacts = response.json()
+            user_data_store[user_id] = contacts
+            logger.info(f"Successfully loaded {len(contacts)} contacts for user {user_id} from link.")
+            await show_main_menu(update, context, f"✅ لینک با موفقیت پردازش شد. {len(contacts)} مخاطب بارگذاری شد.\n\nلطفاً دسته‌بندی مورد نظر را انتخاب کنید:")
+        except Exception as e:
+            logger.error(f"Error processing link for user {user_id}: {e}")
+            await update.message.reply_text(f"❌ خطای غیرمنتظره‌ای رخ داد: {e}")
+    else:
+        await update.message.reply_text("لطفاً یک فایل JSON یا لینک معتبر Gist GitHub ارسال کنید.")
+
+async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    user_id = query.effective_user.id
+    data = user_data_store.get(user_id)
+    if not data:
+        await query.edit_message_text(text="❌ اطلاعاتی برای نمایش وجود ندارد. لطفاً ابتدا یک فایل ارسال کنید.")
+        return
+
+    parts = query.data.split('_')
+    command = parts[0]
+
+    if command == 'cat':
+        category = '_'.join(parts[1:])
+        page = 0
+    elif command == 'page':
+        category = parts[1]
+        page = int(parts[2])
+    elif command == 'back':
+        await show_main_menu(update, context, "لطفاً دسته‌بندی مورد نظر را انتخاب کنید:")
+        return
+    else: return
+
+    filtered_contacts = data if category == 'all' else [c for c in data if c.get('role') == category]
+    if not filtered_contacts:
+        await query.edit_message_text(text=f"هیچ مخاطبی در دسته‌بندی '{get_role_label(category)}' یافت نشد.")
+        return
+
+    items_per_page = 5
+    start_index = page * items_per_page
+    end_index = start_index + items_per_page
+    paginated_contacts = filtered_contacts[start_index:end_index]
+
+    message_text = f"📂 *دسته بندی:* {get_role_label(category)}\n"
+    message_text += f"👥 *تعداد کل:* {len(filtered_contacts)}\n\n"
+    message_text += "\n".join([format_contact(c) for c in paginated_contacts])
+
+    keyboard_nav = []
+    row = []
+    if page > 0: row.append(InlineKeyboardButton("⬅️ قبلی", callback_data=f"page_{category}_{page - 1}"))
+    if end_index < len(filtered_contacts): row.append(InlineKeyboardButton("بعدی ➡️", callback_data=f"page_{category}_{page + 1}"))
+    if row: keyboard_nav.append(row)
+    keyboard_nav.append([InlineKeyboardButton("بازگشت به منو اصلی", callback_data="back_to_menu")])
+
+    await query.edit_message_text(text=message_text, reply_markup=InlineKeyboardMarkup(keyboard_nav), parse_mode='Markdown')
+
+def main() -> None:
+    application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(MessageHandler(filters.Document.MimeType("application/json"), handle_file))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
+    application.add_handler(CallbackQueryHandler(button_callback))
+    application.run_polling()
+
+if __name__ == '__main__':
+    main()
